@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn, einsum
+from torch.autograd import Function
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
@@ -148,6 +149,29 @@ class SpatialSelfAttention(nn.Module):
 
         return x+h_
 
+class Attn1(Function):
+    @staticmethod
+    def forward(self, input, mask, in_project_weight, in_project_bias, out_project_weight, out_project_bias, temperature, gamma, heads):
+        return input
+
+    @staticmethod
+    def symbolic(g, input, key_padding_mask, in_project_weight, in_project_bias, out_project_weight, out_project_bias, temperature, gamma, heads):
+        # key_padding_mask : None
+        # in_project_weight : coant q,k,v param 
+        return g.op("pmx::SelfAttention", input, key_padding_mask, in_project_weight, in_project_bias, \
+                        out_project_weight, out_project_bias, temperature, gamma, num_heads_i = heads, l2norm_i = 0, attn_type_i = 0)
+
+class Attn2(Function):
+    @staticmethod
+    def forward(self, input, context, mask, in_project_weight_q, in_project_weight_k, in_project_weight_v, out_project_weight, out_project_bias, temperature, gamma, heads):
+        return input
+
+    @staticmethod
+    def symbolic(g, input, context, key_padding_mask, in_project_weight_q, in_project_weight_k, in_project_weight_v, out_project_weight, out_project_bias, temperature, gamma, heads):
+        # key_padding_mask : None
+        # in_project_weight : coant q,k,v param 
+        return g.op("pmx::ContextAttention", input, context, key_padding_mask, in_project_weight_q, in_project_weight_k, in_project_weight_v, \
+                        out_project_weight, out_project_bias, temperature, gamma, num_heads_i = heads, l2norm_i = 0, attn_type_i = 0)
 
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
@@ -167,30 +191,73 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
+        self.attn1 = Attn1.apply
+        self.attn2 = Attn2.apply
+
     def forward(self, x, context=None, mask=None):
         h = self.heads
+        weight_q = self.to_q.state_dict()['weight']
+        weight_k = self.to_k.state_dict()['weight']
+        weight_v = self.to_v.state_dict()['weight']
 
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
+        if exists(context):
+            in_project_weight_q = weight_q.transpose(1,0)
+            in_project_weight_k = weight_k.transpose(1,0)
+            in_project_weight_v = weight_v.transpose(1,0)
+            out_project_weight = self.to_out.state_dict()['0.weight'].transpose(1,0)
+            out_project_bias = self.to_out.state_dict()['0.bias']
+            res = self.attn2(x, context, torch.empty((0), dtype=torch.float32), in_project_weight_q, in_project_weight_k, in_project_weight_v, out_project_weight, out_project_bias, torch.empty((0), dtype=torch.float32), torch.empty((0), dtype=torch.float32), h)
+        else:
+            in_project_weight = torch.concat([weight_q.transpose(1,0), weight_k.transpose(1,0), weight_v.transpose(1,0)], dim=-1)
+            in_project_bias = torch.empty((0), dtype=torch.float32)
+            out_project_weight = self.to_out.state_dict()['0.weight'].transpose(1,0)
+            out_project_bias = self.to_out.state_dict()['0.bias']
+            res = self.attn1(x, torch.empty((0), dtype=torch.float32), in_project_weight, in_project_bias, out_project_weight, out_project_bias, torch.empty((0), dtype=torch.float32), torch.empty((0), dtype=torch.float32), h)
+        
+        return res
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+# class CrossAttention(nn.Module):
+#     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+#         super().__init__()
+#         inner_dim = dim_head * heads
+#         context_dim = default(context_dim, query_dim)
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+#         self.scale = dim_head ** -0.5
+#         self.heads = heads
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
+#         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+#         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+#         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
+#         self.to_out = nn.Sequential(
+#             nn.Linear(inner_dim, query_dim),
+#             nn.Dropout(dropout)
+#         )
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+#     def forward(self, x, context=None, mask=None):
+#         h = self.heads
+
+#         q = self.to_q(x)
+#         context = default(context, x)
+#         k = self.to_k(context)
+#         v = self.to_v(context)
+
+#         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+#         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+#         if exists(mask):
+#             mask = rearrange(mask, 'b ... -> b (...)')
+#             max_neg_value = -torch.finfo(sim.dtype).max
+#             mask = repeat(mask, 'b j -> (b h) () j', h=h)
+#             sim.masked_fill_(~mask, max_neg_value)
+
+#         # attention, what we cannot get enough of
+#         attn = sim.softmax(dim=-1)
+
+#         out = einsum('b i j, b j d -> b i d', attn, v)
+#         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+#         return self.to_out(out)
 
 
 class BasicTransformerBlock(nn.Module):

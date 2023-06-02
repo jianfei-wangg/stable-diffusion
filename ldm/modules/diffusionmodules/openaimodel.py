@@ -4,9 +4,11 @@ import math
 from typing import Iterable
 
 import numpy as np
+import torch
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd import Function
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -19,6 +21,31 @@ from ldm.modules.diffusionmodules.util import (
 )
 from ldm.modules.attention import SpatialTransformer
 
+import sys
+import os
+# sys.path.append("./")
+# from pyppl.ppl_runner import PPLRunner
+
+class GroupNormFunc(Function):
+    @staticmethod
+    def forward(self, channels, weight, bias, eps):
+        return channels
+    
+    @staticmethod
+    def symbolic(g, input, alpha, beta, eps):
+        print("trace group norm")
+        return g.op("pmx::GroupNorm", input, alpha, beta, \
+                    group_i = 32, moving_average_fraction_f = 0.999, use_global_stats_i = True, eps_f = eps) 
+
+# feedforward
+class GroupNorm(nn.Module):
+    def __init__(self, eps = 1e-5):
+        super(GroupNorm, self).__init__()
+        self.func = GroupNormFunc.apply
+        self.eps = eps
+
+    def forward(self, x, alpha, beta):
+        return self.func(x, alpha, beta, self.eps)
 
 # dummy replace
 def convert_module_to_f16(x):
@@ -301,6 +328,7 @@ class AttentionBlock(nn.Module):
             self.num_heads = channels // num_head_channels
         self.use_checkpoint = use_checkpoint
         self.norm = normalization(channels)
+        self.group = GroupNorm()
         self.qkv = conv_nd(1, channels, channels * 3, 1)
         if use_new_attention_order:
             # split qkv before split heads
@@ -312,13 +340,15 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        return checkpoint(self._forward, (x,), self.parameters(), False)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
-        qkv = self.qkv(self.norm(x))
+        # qkv = self.qkv(self.norm(x))
+        x = self.group(x, self.norm.state_dict()['weight'], self.norm.state_dict()['bias'])
+        qkv = self.qkv(x)
         h = self.attention(qkv)
         h = self.proj_out(h)
         return (x + h).reshape(b, c, *spatial)
@@ -468,6 +498,9 @@ class UNetModel(nn.Module):
         legacy=True,
     ):
         super().__init__()
+        print('------------------ UNetModel ----------------')
+        print(image_size, in_channels, out_channels, model_channels, attention_resolutions, num_res_blocks, channel_mult, num_heads, use_spatial_transformer, transformer_depth, context_dim, use_checkpoint, legacy)
+        print('------------------ UNetModel ----------------')
         if use_spatial_transformer:
             assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
 
@@ -691,6 +724,11 @@ class UNetModel(nn.Module):
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
 
+        
+        # self.runner = PPLRunner("/mnt/hpc/share/wjf/JF_Works/30420_sd_test/pypplSample/unet_fused/unet_fused_sim.onnx", "/mnt/hpc/share/wjf/JF_Works/30420_sd_test/pypplSample/unet_algo.json")
+        self.iter_count = 0
+        
+
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.
@@ -708,6 +746,42 @@ class UNetModel(nn.Module):
         self.output_blocks.apply(convert_module_to_f32)
 
     def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+        output = self.torch_forward(x, timesteps=timesteps, context=context, y=y, **kwargs)
+        # output = self.runner.forward({"x": x, "timesteps": timesteps.float(), "context": context})['output']
+        self.iter_count = self.iter_count + 1
+        if self.iter_count == 1 and not os.path.isfile("/mnt/hpc/share/wjf/JF_Works/30601_diffusion_onnx/stable-diffusion/sd_model_save/input.dat"):
+            cpu_x = x.detach().cpu().numpy().astype(np.float32)
+            cpu_timesteps = timesteps.detach().cpu().numpy().astype(np.float32)
+            cpu_context = context.detach().cpu().numpy().astype(np.float32)
+            cpu_output = output.detach().cpu().numpy().astype(np.float32)
+            cpu_x.tofile("/mnt/hpc/share/wjf/JF_Works/30601_diffusion_onnx/stable-diffusion/sd_model_save/input.dat")
+            cpu_timesteps.tofile("/mnt/hpc/share/wjf/JF_Works/30601_diffusion_onnx/stable-diffusion/sd_model_save/timesteps.dat")
+            cpu_context.tofile("/mnt/hpc/share/wjf/JF_Works/30601_diffusion_onnx/stable-diffusion/sd_model_save/context.dat")
+            cpu_output.tofile("/mnt/hpc/share/wjf/JF_Works/30601_diffusion_onnx/stable-diffusion/sd_model_save/output.dat")
+                
+            inputs = x.float(), timesteps.float(), context.float()
+            dynamic_axes = {
+                'x': {0:'batch', 2: 'H', 3: 'W'},
+                'timesteps': {0: 'batch'},
+                'context': {0:'batch', 1: 'L'}
+                }
+            new_model = self.to(torch.float)
+            with torch.inference_mode():
+                torch.onnx.export(new_model,
+                            inputs,
+                            f"/mnt/hpc/share/wjf/JF_Works/30601_diffusion_onnx/stable-diffusion/sd_model_save/sd15.onnx",
+                            export_params=True,
+                            opset_version=13,
+                            do_constant_folding=True,
+                            verbose=False,
+                            input_names=['x','timesteps','context'],
+                            output_names=['output'],
+                            dynamic_axes=dynamic_axes,
+                            operator_export_type=torch.onnx.OperatorExportTypes.ONNX)
+
+        return output
+
+    def torch_forward(self, x, timesteps=None, context=None, y=None,**kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
